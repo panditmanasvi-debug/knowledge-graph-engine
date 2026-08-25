@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+ENHANCED MVP - Load papers from CSV for easy data entry
+Usage: python hackathon-mvp-enhanced.py [path-to-csv]
+Default: papers-template.csv
+"""
+
+import json
+import csv
+import sys
+from typing import Dict, List
+from dataclasses import dataclass
+from collections import defaultdict
+
+# ============================================================================
+# SIMPLE IN-MEMORY GRAPH DATABASE
+# ============================================================================
+
+@dataclass
+class Entity:
+    name: str
+    entity_type: str  # method, dataset, concept, author
+    papers_using_it: List[str]  # doc IDs
+
+class KnowledgeGraph:
+    def __init__(self):
+        self.docs = {}
+        self.entities = {}  # (name, type) -> Entity
+        self.relationships = defaultdict(list)  # doc_id -> [(entity_name, entity_type, relation_type)]
+    
+    def add_document(self, doc):
+        self.docs[doc["id"]] = doc
+    
+    def add_entities_from_doc(self, doc_id, entities_dict):
+        """entities_dict has keys: methods, datasets, concepts"""
+        
+        for entity_type, entities_list in entities_dict.items():
+            # Normalize entity_type for storage
+            storage_type = entity_type.rstrip('s')  # "methods" -> "method"
+            
+            for entity_name in entities_list:
+                if not entity_name.strip():  # Skip empty
+                    continue
+                    
+                key = (entity_name, storage_type)
+                
+                if key not in self.entities:
+                    self.entities[key] = Entity(entity_name, storage_type, [])
+                
+                if doc_id not in self.entities[key].papers_using_it:
+                    self.entities[key].papers_using_it.append(doc_id)
+                
+                self.relationships[doc_id].append((entity_name, storage_type, "uses"))
+    
+    def find_hidden_connections(self):
+        """
+        Find pairs of papers from DIFFERENT departments 
+        that share methods/concepts/datasets but don't cite each other
+        """
+        connections = []
+        
+        # Build a map: (entity_name, entity_type) -> list of doc_ids
+        entity_to_docs = defaultdict(list)
+        for (entity_name, entity_type), entity in self.entities.items():
+            entity_to_docs[(entity_name, entity_type)] = entity.papers_using_it
+        
+        # For each entity, check if multiple docs from different depts use it
+        for (entity_name, entity_type), doc_ids in entity_to_docs.items():
+            if len(doc_ids) < 2:
+                continue
+            
+            # Group by department
+            depts = defaultdict(list)
+            for doc_id in doc_ids:
+                dept = self.docs[doc_id]["dept"]
+                depts[dept].append(doc_id)
+            
+            # If entity appears in multiple departments, it's a connection
+            if len(depts) > 1:
+                for dept1, docs1 in depts.items():
+                    for dept2, docs2 in depts.items():
+                        if dept1 < dept2:  # Avoid duplicates
+                            for doc_id1 in docs1:
+                                for doc_id2 in docs2:
+                                    connections.append({
+                                        "paper1": self.docs[doc_id1]["title"],
+                                        "dept1": dept1,
+                                        "author1": self.docs[doc_id1]["author"],
+                                        "paper2": self.docs[doc_id2]["title"],
+                                        "dept2": dept2,
+                                        "author2": self.docs[doc_id2]["author"],
+                                        "shared_entity": entity_name,
+                                        "entity_type": entity_type
+                                    })
+        
+        return connections
+    
+    def get_graph_viz_data(self):
+        """Return data for force-directed graph visualization"""
+        nodes = []
+        edges = []
+        node_ids = set()
+        
+        # Add document nodes
+        for doc_id, doc in self.docs.items():
+            title = doc["title"][:40] + "..." if len(doc["title"]) > 40 else doc["title"]
+            nodes.append({
+                "id": doc_id,
+                "label": title,
+                "type": "paper",
+                "group": doc["dept"],
+                "title": doc["title"],
+                "author": doc.get("author", "Unknown")
+            })
+            node_ids.add(doc_id)
+        
+        # Add entity nodes and edges
+        for (entity_name, entity_type), entity in self.entities.items():
+            if entity.papers_using_it:  # Only add if connected
+                entity_id = f"{entity_type}:{entity_name}"
+                nodes.append({
+                    "id": entity_id,
+                    "label": entity_name[:25],
+                    "type": entity_type,
+                    "group": entity_type
+                })
+                node_ids.add(entity_id)
+                
+                # Edges from papers to entities
+                for doc_id in entity.papers_using_it:
+                    edges.append({
+                        "source": doc_id,
+                        "target": entity_id,
+                        "label": "uses"
+                    })
+        
+        return {"nodes": nodes, "edges": edges}
+
+# ============================================================================
+# CSV LOADER
+# ============================================================================
+
+def load_from_csv(csv_path: str):
+    """
+    Load papers from CSV.
+    Expected columns: id, title, department, author, abstract, methods, datasets, concepts
+    (methods, datasets, concepts are pipe-separated: "method1|method2|method3")
+    """
+    docs = []
+    entities = {}
+    
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row.get('id') or row['id'].startswith('YOUR_'):
+                    continue  # Skip template rows
+                
+                doc = {
+                    "id": row['id'],
+                    "title": row['title'],
+                    "dept": row['department'],
+                    "author": row['author'],
+                    "abstract": row.get('abstract', '')
+                }
+                docs.append(doc)
+                
+                # Parse pipe-separated entities
+                entities[doc['id']] = {
+                    "methods": [m.strip() for m in row.get('methods', '').split('|') if m.strip()],
+                    "datasets": [d.strip() for d in row.get('datasets', '').split('|') if d.strip()],
+                    "concepts": [c.strip() for c in row.get('concepts', '').split('|') if c.strip()]
+                }
+        
+        return docs, entities
+    
+    except FileNotFoundError:
+        print(f"❌ File not found: {csv_path}")
+        print("Using built-in mock data instead...")
+        return None, None
+
+# ============================================================================
+# MOCK DATA (fallback)
+# ============================================================================
+
+MOCK_RESEARCH_DOCS = [
+    {
+        "id": "doc1",
+        "title": "Graph Neural Networks for Protein Folding",
+        "dept": "Computer Science",
+        "author": "Alice Chen",
+        "abstract": "We propose GNN architecture to predict protein structures using graph representations of amino acid sequences."
+    },
+    {
+        "id": "doc2",
+        "title": "Deep Learning Approaches to Molecular Structure Prediction",
+        "dept": "Biology",
+        "author": "Bob Singh",
+        "abstract": "Explores neural network embeddings for predicting molecular properties using attention mechanisms."
+    },
+    {
+        "id": "doc3",
+        "title": "Vector Database Optimization for Medical Records",
+        "dept": "Information Systems",
+        "author": "Carol Martinez",
+        "abstract": "Efficient vector embedding storage and similarity search on large medical datasets."
+    },
+    {
+        "id": "doc4",
+        "title": "Attention Mechanisms in Sequence Models",
+        "dept": "Computer Science",
+        "author": "Diana Wong",
+        "abstract": "Survey of attention mechanisms used in transformer models and sequence-to-sequence architectures."
+    },
+    {
+        "id": "doc5",
+        "title": "Graph Theory Applications in Biological Networks",
+        "dept": "Biology",
+        "author": "Eve Johnson",
+        "abstract": "How graph representations help model protein-protein interactions and cellular pathways."
+    }
+]
+
+MOCK_ENTITIES = {
+    "doc1": {
+        "methods": ["Graph Neural Networks", "attention mechanisms", "vector embeddings"],
+        "datasets": ["protein sequences", "amino acid data"],
+        "concepts": ["protein structure", "deep learning"]
+    },
+    "doc2": {
+        "methods": ["neural networks", "attention-based mechanisms", "embeddings"],
+        "datasets": ["molecular properties", "molecular graphs"],
+        "concepts": ["molecular prediction", "deep learning"]
+    },
+    "doc3": {
+        "methods": ["vector embedding", "attention pooling", "similarity search"],
+        "datasets": ["medical records"],
+        "concepts": ["databases", "information retrieval"]
+    },
+    "doc4": {
+        "methods": ["attention mechanisms", "transformers", "embeddings", "sequence models"],
+        "datasets": [],
+        "concepts": ["deep learning", "NLP"]
+    },
+    "doc5": {
+        "methods": ["graph algorithms", "graph representations"],
+        "datasets": ["protein-protein interactions", "cellular pathways"],
+        "concepts": ["biological networks", "graph theory"]
+    }
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    csv_path = sys.argv[1] if len(sys.argv) > 1 else "papers-template.csv"
+    
+    print("=" * 70)
+    print("KNOWLEDGE GRAPH ENGINE - LIVE DEMO")
+    print("=" * 70)
+    
+    # Try to load from CSV
+    docs, entities_map = load_from_csv(csv_path)
+    
+    if docs is None:
+        print(f"\nUsing built-in mock data ({len(MOCK_RESEARCH_DOCS)} papers)")
+        docs = MOCK_RESEARCH_DOCS
+        entities_map = MOCK_ENTITIES
+    else:
+        print(f"\n✓ Loaded {len(docs)} papers from {csv_path}")
+    
+    # Initialize graph
+    graph = KnowledgeGraph()
+    
+    # Load data
+    print("\n[1] Loading research documents...")
+    for doc in docs:
+        graph.add_document(doc)
+        if doc["id"] in entities_map:
+            graph.add_entities_from_doc(doc["id"], entities_map[doc["id"]])
+    
+    print(f"✓ Loaded {len(graph.docs)} documents")
+    print(f"✓ Extracted {len(graph.entities)} unique entities")
+    
+    # Find hidden connections
+    print("\n[2] Discovering hidden cross-departmental connections...")
+    connections = graph.find_hidden_connections()
+    
+    print(f"\n🔗 FOUND {len(connections)} HIDDEN CONNECTIONS:\n")
+    for i, conn in enumerate(connections, 1):
+        print(f"\n[Connection #{i}]")
+        print(f"  📄 {conn['paper1']}")
+        print(f"     Dept: {conn['dept1']} | Author: {conn['author1']}")
+        print(f"     ↕️  SHARED: {conn['shared_entity']} (via {conn['entity_type']})")
+        print(f"  📄 {conn['paper2']}")
+        print(f"     Dept: {conn['dept2']} | Author: {conn['author2']}")
+    
+    # Generate graph data for visualization
+    print("\n[3] Generating graph visualization data...")
+    graph_data = graph.get_graph_viz_data()
+    
+    print(f"✓ Graph has {len(graph_data['nodes'])} nodes and {len(graph_data['edges'])} edges")
+    
+    # Save output
+    output = {
+        "summary": {
+            "total_papers": len(graph.docs),
+            "total_entities": len(graph.entities),
+            "hidden_connections_found": len(connections)
+        },
+        "connections": connections,
+        "graph": graph_data
+    }
+    
+    with open("/mnt/user-data/outputs/graph-results.json", "w") as f:
+        json.dump(output, f, indent=2)
+    
+    print("\n✅ Results saved to graph-results.json")
+    print("=" * 70)
+    
+    return output
+
+if __name__ == "__main__":
+    main()
